@@ -1,0 +1,271 @@
+name: Shared Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      application_name:
+        description: 'Application name'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment (dev, staging, prod)'
+        required: true
+        type: string
+      application_type:
+        description: 'Application type (java-spring-boot, nodejs)'
+        required: true
+        type: string
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: './Dockerfile'
+      helm_chart_path:
+        description: 'Path to Helm chart'
+        required: false
+        type: string
+        default: './helm-chart'
+      run_regression_tests:
+        description: 'Run regression tests'
+        required: false
+        type: boolean
+        default: true
+      skip_security_scans:
+        description: 'Skip security scans (not recommended for production)'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'Azure Service Principal Client ID'
+        required: true
+      AZURE_CLIENT_SECRET:
+        description: 'Azure Service Principal Client Secret'
+        required: true
+      AZURE_TENANT_ID:
+        description: 'Azure Tenant ID'
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: 'Azure Subscription ID'
+        required: true
+      ACR_LOGIN_SERVER:
+        description: 'Azure Container Registry login server'
+        required: true
+      AKS_CLUSTER_NAME:
+        description: 'AKS cluster name'
+        required: true
+      AKS_RESOURCE_GROUP:
+        description: 'AKS resource group'
+        required: true
+      SONAR_TOKEN:
+        description: 'SonarQube token'
+        required: true
+      CHECKMARX_TOKEN:
+        description: 'Checkmarx token'
+        required: true
+      AZURE_KEY_VAULT_NAME:
+        description: 'Azure Key Vault name'
+        required: true
+
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: ${{ inputs.application_name }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
+      should_deploy: ${{ steps.changes.outputs.should_deploy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Environment
+        id: setup
+        uses: ./.github/actions/setup-environment
+        with:
+          application_type: ${{ inputs.application_type }}
+          environment: ${{ inputs.environment }}
+
+      - name: Generate Version
+        id: version
+        run: |
+          if [[ "${{ inputs.environment }}" == "prod" ]]; then
+            # Use semantic versioning for production
+            if [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
+              VERSION=${GITHUB_REF#refs/tags/}
+            else
+              VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "1.0.0")
+            fi
+            IMAGE_TAG=$VERSION
+          else
+            # Use short SHA for development environments
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            VERSION="dev-$SHORT_SHA"
+            IMAGE_TAG=$SHORT_SHA
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION, image tag: $IMAGE_TAG"
+
+      - name: Check for Changes
+        id: changes
+        run: |
+          # Check if there are changes that require deployment
+          if [[ "${{ github.event_name }}" == "push" ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  security-scans:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: ${{ !inputs.skip_security_scans }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-environment
+        with:
+          application_type: ${{ inputs.application_type }}
+          environment: ${{ inputs.environment }}
+
+      - name: Run Security Scans
+        uses: ./.github/actions/security-scans
+        with:
+          application_type: ${{ inputs.application_type }}
+          sonar_token: ${{ secrets.SONAR_TOKEN }}
+          checkmarx_token: ${{ secrets.CHECKMARX_TOKEN }}
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [setup, security-scans]
+    if: ${{ always() && (needs.security-scans.result == 'success' || needs.security-scans.result == 'skipped') && needs.setup.outputs.should_deploy == 'true' }}
+    outputs:
+      image_digest: ${{ steps.build.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-environment
+        with:
+          application_type: ${{ inputs.application_type }}
+          environment: ${{ inputs.environment }}
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build Application
+        id: build
+        uses: ./.github/actions/build-application
+        with:
+          application_type: ${{ inputs.application_type }}
+          dockerfile_path: ${{ inputs.dockerfile_path }}
+          image_name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image_tag: ${{ needs.setup.outputs.image_tag }}
+          build_args: |
+            VERSION=${{ needs.setup.outputs.version }}
+            ENVIRONMENT=${{ inputs.environment }}
+
+  container-security-scan:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: ${{ always() && needs.build-and-push.result == 'success' }}
+    steps:
+      - name: Run Container Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.setup.outputs.image_tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  regression-tests:
+    runs-on: ubuntu-latest
+    needs: [setup, build-and-push]
+    if: ${{ inputs.run_regression_tests && needs.build-and-push.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-environment
+        with:
+          application_type: ${{ inputs.application_type }}
+          environment: ${{ inputs.environment }}
+
+      - name: Run Regression Tests
+        run: |
+          # Run application-specific regression tests
+          if [[ "${{ inputs.application_type }}" == "java-spring-boot" ]]; then
+            ./mvnw test -Dspring.profiles.active=regression
+          elif [[ "${{ inputs.application_type }}" == "nodejs" ]]; then
+            npm run test:regression
+          fi
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [setup, build-and-push, container-security-scan, regression-tests]
+    if: ${{ always() && needs.build-and-push.result == 'success' && (needs.container-security-scan.result == 'success' || needs.container-security-scan.result == 'skipped') && (needs.regression-tests.result == 'success' || needs.regression-tests.result == 'skipped') }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Environment
+        uses: ./.github/actions/setup-environment
+        with:
+          application_type: ${{ inputs.application_type }}
+          environment: ${{ inputs.environment }}
+
+      - name: Get Azure Key Vault Secrets
+        uses: ./.github/actions/azure-keyvault
+        with:
+          azure_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          key_vault_name: ${{ secrets.AZURE_KEY_VAULT_NAME }}
+          application_name: ${{ inputs.application_name }}
+          environment: ${{ inputs.environment }}
+
+      - name: Deploy to AKS
+        uses: ./.github/actions/helm-deploy
+        with:
+          application_name: ${{ inputs.application_name }}
+          environment: ${{ inputs.environment }}
+          image_tag: ${{ needs.setup.outputs.image_tag }}
+          version: ${{ needs.setup.outputs.version }}
+          helm_chart_path: ${{ inputs.helm_chart_path }}
+          azure_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          aks_cluster_name: ${{ secrets.AKS_CLUSTER_NAME }}
+          aks_resource_group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Notify Deployment Status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "✅ Deployment successful for ${{ inputs.application_name }} in ${{ inputs.environment }}"
+          else
+            echo "❌ Deployment failed for ${{ inputs.application_name }} in ${{ inputs.environment }}"
+            exit 1
+          fi

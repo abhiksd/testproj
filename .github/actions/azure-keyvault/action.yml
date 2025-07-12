@@ -1,0 +1,185 @@
+name: 'Azure Key Vault'
+description: 'Retrieve application-specific secrets from Azure Key Vault'
+inputs:
+  azure_client_id:
+    description: 'Azure Service Principal Client ID'
+    required: true
+  azure_client_secret:
+    description: 'Azure Service Principal Client Secret'
+    required: true
+  azure_tenant_id:
+    description: 'Azure Tenant ID'
+    required: true
+  key_vault_name:
+    description: 'Azure Key Vault name'
+    required: true
+  application_name:
+    description: 'Application name'
+    required: true
+  environment:
+    description: 'Environment (dev, staging, prod)'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: |
+          {
+            "clientId": "${{ inputs.azure_client_id }}",
+            "clientSecret": "${{ inputs.azure_client_secret }}",
+            "tenantId": "${{ inputs.azure_tenant_id }}"
+          }
+
+    - name: Install Azure CLI
+      shell: bash
+      run: |
+        if ! command -v az &> /dev/null; then
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        fi
+
+    - name: Retrieve Application Secrets
+      shell: bash
+      run: |
+        echo "🔐 Retrieving secrets from Azure Key Vault: ${{ inputs.key_vault_name }}"
+        
+        # Define secret naming patterns
+        # Format: <app-name>-<environment>-<secret-name>
+        APP_PREFIX="${{ inputs.application_name }}-${{ inputs.environment }}"
+        
+        # Common application secrets
+        COMMON_SECRETS=(
+          "database-url"
+          "database-username"
+          "database-password"
+          "redis-url"
+          "jwt-secret"
+          "api-key"
+          "encryption-key"
+        )
+        
+        # Application-specific secrets
+        if [[ "${{ inputs.application_name }}" == *"payment"* ]]; then
+          APP_SECRETS+=("stripe-secret-key" "paypal-client-secret")
+        elif [[ "${{ inputs.application_name }}" == *"notification"* ]]; then
+          APP_SECRETS+=("smtp-password" "twilio-auth-token" "firebase-key")
+        elif [[ "${{ inputs.application_name }}" == *"auth"* ]]; then
+          APP_SECRETS+=("oauth-client-secret" "ldap-password")
+        fi
+        
+        # Function to safely retrieve and set secret
+        retrieve_secret() {
+          local secret_name="$1"
+          local env_var_name="$2"
+          
+          if az keyvault secret show --vault-name "${{ inputs.key_vault_name }}" --name "$secret_name" &>/dev/null; then
+            SECRET_VALUE=$(az keyvault secret show \
+              --vault-name "${{ inputs.key_vault_name }}" \
+              --name "$secret_name" \
+              --query value -o tsv)
+            
+            if [ -n "$SECRET_VALUE" ]; then
+              echo "::add-mask::$SECRET_VALUE"
+              echo "$env_var_name=$SECRET_VALUE" >> $GITHUB_ENV
+              echo "✅ Retrieved: $secret_name"
+            else
+              echo "⚠️  Empty value for: $secret_name"
+            fi
+          else
+            echo "⚠️  Secret not found: $secret_name"
+          fi
+        }
+        
+        # Retrieve common secrets
+        for secret in "${COMMON_SECRETS[@]}"; do
+          secret_name="${APP_PREFIX}-${secret}"
+          env_var_name=$(echo "${secret}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          retrieve_secret "$secret_name" "$env_var_name"
+        done
+        
+        # Retrieve application-specific secrets
+        for secret in "${APP_SECRETS[@]}"; do
+          secret_name="${APP_PREFIX}-${secret}"
+          env_var_name=$(echo "${secret}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          retrieve_secret "$secret_name" "$env_var_name"
+        done
+        
+        # Retrieve configuration properties
+        CONFIG_SECRETS=(
+          "log-level"
+          "max-connections"
+          "timeout"
+          "feature-flags"
+        )
+        
+        for config in "${CONFIG_SECRETS[@]}"; do
+          config_name="${APP_PREFIX}-config-${config}"
+          env_var_name="CONFIG_$(echo "${config}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+          retrieve_secret "$config_name" "$env_var_name"
+        done
+
+    - name: Create Kubernetes Secret Manifest
+      shell: bash
+      run: |
+        echo "📝 Creating Kubernetes secret manifest"
+        
+        # Create a temporary secret file for Kubernetes deployment
+        cat > k8s-secrets.env << EOF
+        # Generated secrets for ${{ inputs.application_name }} in ${{ inputs.environment }}
+        DATABASE_URL=${DATABASE_URL:-}
+        DATABASE_USERNAME=${DATABASE_USERNAME:-}
+        DATABASE_PASSWORD=${DATABASE_PASSWORD:-}
+        REDIS_URL=${REDIS_URL:-}
+        JWT_SECRET=${JWT_SECRET:-}
+        API_KEY=${API_KEY:-}
+        ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+        # Add application-specific secrets here
+        EOF
+        
+        # Remove empty lines and mask the file
+        sed -i '/^$/d' k8s-secrets.env
+        sed -i '/=-$/d' k8s-secrets.env
+        
+        echo "✅ Kubernetes secret manifest created"
+
+    - name: Validate Required Secrets
+      shell: bash
+      run: |
+        echo "🔍 Validating required secrets are present"
+        
+        REQUIRED_SECRETS=()
+        
+        # Define required secrets based on application type
+        case "${{ inputs.application_name }}" in
+          *"api"*|*"backend"*)
+            REQUIRED_SECRETS+=("DATABASE_URL" "JWT_SECRET")
+            ;;
+          *"frontend"*|*"web"*)
+            REQUIRED_SECRETS+=("API_KEY")
+            ;;
+        esac
+        
+        # Check if required secrets are present
+        MISSING_SECRETS=()
+        for secret in "${REQUIRED_SECRETS[@]}"; do
+          if [ -z "${!secret}" ]; then
+            MISSING_SECRETS+=("$secret")
+          fi
+        done
+        
+        if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
+          echo "❌ Missing required secrets:"
+          printf '  - %s\n' "${MISSING_SECRETS[@]}"
+          echo "Please ensure these secrets are configured in Azure Key Vault with the naming convention:"
+          echo "  ${{ inputs.application_name }}-${{ inputs.environment }}-<secret-name>"
+          exit 1
+        fi
+        
+        echo "✅ All required secrets are present"
+
+    - name: Azure Logout
+      shell: bash
+      run: az logout
+      if: always()

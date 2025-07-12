@@ -1,0 +1,371 @@
+name: 'Helm Deploy'
+description: 'Deploy application to AKS using Helm chart'
+inputs:
+  application_name:
+    description: 'Application name'
+    required: true
+  environment:
+    description: 'Environment (dev, staging, prod)'
+    required: true
+  image_tag:
+    description: 'Docker image tag'
+    required: true
+  version:
+    description: 'Application version'
+    required: true
+  helm_chart_path:
+    description: 'Path to Helm chart'
+    required: true
+  azure_client_id:
+    description: 'Azure Service Principal Client ID'
+    required: true
+  azure_client_secret:
+    description: 'Azure Service Principal Client Secret'
+    required: true
+  azure_tenant_id:
+    description: 'Azure Tenant ID'
+    required: true
+  azure_subscription_id:
+    description: 'Azure Subscription ID'
+    required: true
+  aks_cluster_name:
+    description: 'AKS cluster name'
+    required: true
+  aks_resource_group:
+    description: 'AKS resource group'
+    required: true
+  registry:
+    description: 'Container registry'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace'
+    required: false
+    default: 'default'
+  timeout:
+    description: 'Helm timeout'
+    required: false
+    default: '10m'
+  replicas:
+    description: 'Number of replicas'
+    required: false
+    default: '2'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: |
+          {
+            "clientId": "${{ inputs.azure_client_id }}",
+            "clientSecret": "${{ inputs.azure_client_secret }}",
+            "tenantId": "${{ inputs.azure_tenant_id }}",
+            "subscriptionId": "${{ inputs.azure_subscription_id }}"
+          }
+
+    - name: Set AKS Context
+      uses: azure/aks-set-context@v3
+      with:
+        resource-group: ${{ inputs.aks_resource_group }}
+        cluster-name: ${{ inputs.aks_cluster_name }}
+
+    - name: Create Namespace
+      shell: bash
+      run: |
+        NAMESPACE="${{ inputs.namespace }}"
+        if [[ "${{ inputs.environment }}" != "prod" ]]; then
+          NAMESPACE="${{ inputs.environment }}-${{ inputs.application_name }}"
+        fi
+        
+        echo "DEPLOYMENT_NAMESPACE=$NAMESPACE" >> $GITHUB_ENV
+        
+        # Create namespace if it doesn't exist
+        kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+        echo "✅ Namespace: $NAMESPACE"
+
+    - name: Setup Helm Values
+      shell: bash
+      run: |
+        echo "📝 Preparing Helm values for deployment"
+        
+        # Create values file for this deployment
+        cat > deployment-values.yaml << EOF
+        # Auto-generated values for ${{ inputs.application_name }} deployment
+        
+        image:
+          repository: ${{ inputs.registry }}/${{ inputs.application_name }}
+          tag: "${{ inputs.image_tag }}"
+          pullPolicy: Always
+        
+        app:
+          name: ${{ inputs.application_name }}
+          version: "${{ inputs.version }}"
+          environment: ${{ inputs.environment }}
+        
+        replicaCount: ${{ inputs.replicas }}
+        
+        service:
+          type: ClusterIP
+          port: 8080
+          targetPort: 8080
+        
+        ingress:
+          enabled: true
+          className: "nginx"
+          annotations:
+            cert-manager.io/cluster-issuer: "letsencrypt-prod"
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          hosts:
+            - host: ${{ inputs.application_name }}-${{ inputs.environment }}.example.com
+              paths:
+                - path: /
+                  pathType: Prefix
+          tls:
+            - secretName: ${{ inputs.application_name }}-tls
+              hosts:
+                - ${{ inputs.application_name }}-${{ inputs.environment }}.example.com
+        
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        
+        autoscaling:
+          enabled: true
+          minReplicas: ${{ inputs.replicas }}
+          maxReplicas: 10
+          targetCPUUtilizationPercentage: 70
+          targetMemoryUtilizationPercentage: 80
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        env:
+          - name: ENVIRONMENT
+            value: "${{ inputs.environment }}"
+          - name: VERSION
+            value: "${{ inputs.version }}"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        
+        # Environment-specific configurations
+        EOF
+        
+        # Add environment-specific configurations
+        if [[ "${{ inputs.environment }}" == "prod" ]]; then
+          cat >> deployment-values.yaml << EOF
+        
+        # Production-specific settings
+        nodeSelector:
+          kubernetes.io/arch: amd64
+          node-type: production
+        
+        tolerations:
+          - key: "production"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
+        
+        affinity:
+          podAntiAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                    - ${{ inputs.application_name }}
+                topologyKey: kubernetes.io/hostname
+        EOF
+        elif [[ "${{ inputs.environment }}" == "dev" ]]; then
+          cat >> deployment-values.yaml << EOF
+        
+        # Development-specific settings
+        replicaCount: 1
+        
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        
+        autoscaling:
+          enabled: false
+        EOF
+        fi
+        
+        echo "✅ Helm values prepared"
+
+    - name: Create Secrets
+      shell: bash
+      run: |
+        if [ -f "k8s-secrets.env" ]; then
+          echo "🔐 Creating Kubernetes secrets"
+          
+          # Create secret from env file
+          kubectl create secret generic ${{ inputs.application_name }}-secrets \
+            --from-env-file=k8s-secrets.env \
+            --namespace=$DEPLOYMENT_NAMESPACE \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Add secret reference to values
+          cat >> deployment-values.yaml << EOF
+        
+        secretRef:
+          name: ${{ inputs.application_name }}-secrets
+        EOF
+          
+          echo "✅ Secrets created"
+        fi
+
+    - name: Lint Helm Chart
+      shell: bash
+      run: |
+        echo "🔍 Linting Helm chart"
+        helm lint ${{ inputs.helm_chart_path }} -f deployment-values.yaml
+
+    - name: Helm Dry Run
+      shell: bash
+      run: |
+        echo "🧪 Running Helm dry-run"
+        helm upgrade ${{ inputs.application_name }} ${{ inputs.helm_chart_path }} \
+          --install \
+          --namespace=$DEPLOYMENT_NAMESPACE \
+          --values=deployment-values.yaml \
+          --set image.tag=${{ inputs.image_tag }} \
+          --set app.version=${{ inputs.version }} \
+          --dry-run --debug
+
+    - name: Deploy with Helm
+      shell: bash
+      run: |
+        echo "🚀 Deploying ${{ inputs.application_name }} to ${{ inputs.environment }}"
+        
+        helm upgrade ${{ inputs.application_name }} ${{ inputs.helm_chart_path }} \
+          --install \
+          --namespace=$DEPLOYMENT_NAMESPACE \
+          --values=deployment-values.yaml \
+          --set image.tag=${{ inputs.image_tag }} \
+          --set app.version=${{ inputs.version }} \
+          --timeout=${{ inputs.timeout }} \
+          --wait \
+          --wait-for-jobs \
+          --history-max=5 \
+          --atomic
+        
+        echo "✅ Deployment completed successfully"
+
+    - name: Verify Deployment
+      shell: bash
+      run: |
+        echo "🔍 Verifying deployment"
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/${{ inputs.application_name }} \
+          --namespace=$DEPLOYMENT_NAMESPACE \
+          --timeout=300s
+        
+        # Check pod status
+        kubectl get pods -l app.kubernetes.io/name=${{ inputs.application_name }} \
+          --namespace=$DEPLOYMENT_NAMESPACE
+        
+        # Check service status
+        kubectl get service ${{ inputs.application_name }} \
+          --namespace=$DEPLOYMENT_NAMESPACE
+        
+        # Get ingress information
+        kubectl get ingress -l app.kubernetes.io/name=${{ inputs.application_name }} \
+          --namespace=$DEPLOYMENT_NAMESPACE
+        
+        echo "✅ Deployment verification completed"
+
+    - name: Run Health Check
+      shell: bash
+      run: |
+        echo "🏥 Running health check"
+        
+        # Wait for pods to be ready
+        kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=${{ inputs.application_name }} \
+          --namespace=$DEPLOYMENT_NAMESPACE \
+          --timeout=300s
+        
+        # Get service endpoint for health check
+        SERVICE_NAME="${{ inputs.application_name }}"
+        
+        # Port forward for health check (if needed)
+        kubectl port-forward service/$SERVICE_NAME 8080:8080 \
+          --namespace=$DEPLOYMENT_NAMESPACE &
+        PORT_FORWARD_PID=$!
+        
+        sleep 5
+        
+        # Perform health check
+        for i in {1..5}; do
+          if curl -f http://localhost:8080/health; then
+            echo "✅ Health check passed"
+            break
+          else
+            echo "⚠️  Health check attempt $i failed, retrying..."
+            sleep 10
+          fi
+        done
+        
+        # Clean up port forward
+        kill $PORT_FORWARD_PID 2>/dev/null || true
+        
+        echo "✅ Health check completed"
+
+    - name: Update Deployment Status
+      shell: bash
+      run: |
+        echo "📊 Deployment Summary"
+        echo "===================="
+        echo "Application: ${{ inputs.application_name }}"
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Version: ${{ inputs.version }}"
+        echo "Image Tag: ${{ inputs.image_tag }}"
+        echo "Namespace: $DEPLOYMENT_NAMESPACE"
+        echo "Timestamp: $(date -u)"
+        
+        # Get Helm release info
+        helm status ${{ inputs.application_name }} --namespace=$DEPLOYMENT_NAMESPACE
+
+    - name: Cleanup
+      shell: bash
+      if: always()
+      run: |
+        # Clean up temporary files
+        rm -f deployment-values.yaml k8s-secrets.env
+        
+        # Azure logout
+        az logout || true

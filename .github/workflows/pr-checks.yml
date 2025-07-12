@@ -1,0 +1,357 @@
+name: PR Quality Gates
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    types: [opened, synchronize, reopened]
+
+env:
+  PR_NUMBER: ${{ github.event.number }}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      java-app: ${{ steps.changes.outputs.java-app }}
+      nodejs-app: ${{ steps.changes.outputs.nodejs-app }}
+      helm-charts: ${{ steps.changes.outputs.helm-charts }}
+      workflows: ${{ steps.changes.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            java-app:
+              - 'java-app/**'
+            nodejs-app:
+              - 'nodejs-app/**'
+            helm-charts:
+              - 'helm-charts/**'
+            workflows:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+
+  validate-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate PR Title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
+          subjectPattern: ^(?![A-Z]).+$
+          subjectPatternError: |
+            The subject "{subject}" found in the pull request title "{title}"
+            didn't match the configured pattern. Please ensure that the subject
+            doesn't start with an uppercase character.
+
+      - name: Check PR Size
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            
+            const additions = pr.additions;
+            const deletions = pr.deletions;
+            const changes = additions + deletions;
+            
+            if (changes > 1000) {
+              core.setFailed(`PR is too large: ${changes} changes. Consider breaking it into smaller PRs.`);
+            } else if (changes > 500) {
+              core.warning(`Large PR: ${changes} changes. Consider reviewing if this can be split.`);
+            }
+            
+            core.info(`PR size: +${additions} -${deletions} (${changes} total changes)`);
+
+  security-baseline:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.java-app == 'true' || needs.detect-changes.outputs.nodejs-app == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Secrets Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Run OWASP Dependency Check
+        if: needs.detect-changes.outputs.java-app == 'true' || needs.detect-changes.outputs.nodejs-app == 'true'
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.repository }}
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+            --out reports
+
+      - name: Upload Dependency Check Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-pr-${{ env.PR_NUMBER }}
+          path: reports/
+
+  java-app-checks:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.java-app == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Tests
+        run: |
+          cd java-app
+          ./mvnw clean test
+
+      - name: Generate Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Java Tests
+          path: 'java-app/target/surefire-reports/*.xml'
+          reporter: java-junit
+
+      - name: Code Coverage
+        run: |
+          cd java-app
+          ./mvnw jacoco:report
+          
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: java-app/target/site/jacoco/jacoco.xml
+          flags: java-app
+
+      - name: SpotBugs Analysis
+        run: |
+          cd java-app
+          ./mvnw compile spotbugs:check
+
+      - name: Checkstyle
+        run: |
+          cd java-app
+          ./mvnw checkstyle:check
+
+  nodejs-app-checks:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.nodejs-app == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'nodejs-app/package-lock.json'
+
+      - name: Install Dependencies
+        run: |
+          cd nodejs-app
+          npm ci
+
+      - name: Lint Code
+        run: |
+          cd nodejs-app
+          npm run lint
+
+      - name: Type Check
+        run: |
+          cd nodejs-app
+          npm run type-check
+
+      - name: Run Tests
+        run: |
+          cd nodejs-app
+          npm test -- --coverage --watchAll=false
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: nodejs-app/coverage/lcov.info
+          flags: nodejs-app
+
+  helm-charts-validation:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.helm-charts == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Lint Helm Charts
+        run: |
+          for chart in helm-charts/*/; do
+            if [ -f "$chart/Chart.yaml" ]; then
+              echo "Linting $chart"
+              helm lint "$chart"
+            fi
+          done
+
+      - name: Validate Helm Templates
+        run: |
+          for chart in helm-charts/*/; do
+            if [ -f "$chart/Chart.yaml" ]; then
+              echo "Validating templates for $chart"
+              helm template test "$chart" --debug --dry-run
+            fi
+          done
+
+      - name: Security Scan Helm Charts
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: helm-charts/
+          framework: helm
+
+  workflow-validation:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.workflows == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate GitHub Actions
+        uses: rhymond/github-action-validate-yaml@v1
+        with:
+          path: .github/workflows/
+
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.java-app == 'true' || needs.detect-changes.outputs.nodejs-app == 'true'
+    strategy:
+      matrix:
+        app: 
+          - ${{ needs.detect-changes.outputs.java-app == 'true' && 'java-app' || '' }}
+          - ${{ needs.detect-changes.outputs.nodejs-app == 'true' && 'nodejs-app' || '' }}
+        exclude:
+          - app: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: |
+          docker build -f ${{ matrix.app }}/Dockerfile -t pr-${{ matrix.app }}:${{ github.sha }} ${{ matrix.app }}/
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pr-${{ matrix.app }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.app }}.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.app }}.sarif'
+
+  pr-summary:
+    runs-on: ubuntu-latest
+    needs: [validate-pr, security-baseline, java-app-checks, nodejs-app-checks, helm-charts-validation, workflow-validation, container-scan]
+    if: always()
+    steps:
+      - name: PR Summary Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needs = ${{ toJSON(needs) }};
+            let comment = '## 🔍 PR Quality Gate Results\n\n';
+            
+            const checks = [
+              { name: 'PR Validation', result: needs['validate-pr']?.result },
+              { name: 'Security Baseline', result: needs['security-baseline']?.result },
+              { name: 'Java App Checks', result: needs['java-app-checks']?.result },
+              { name: 'Node.js App Checks', result: needs['nodejs-app-checks']?.result },
+              { name: 'Helm Charts Validation', result: needs['helm-charts-validation']?.result },
+              { name: 'Workflow Validation', result: needs['workflow-validation']?.result },
+              { name: 'Container Security Scan', result: needs['container-scan']?.result },
+            ].filter(check => check.result && check.result !== 'skipped');
+            
+            checks.forEach(check => {
+              const icon = check.result === 'success' ? '✅' : '❌';
+              comment += `- ${icon} ${check.name}: ${check.result}\n`;
+            });
+            
+            const allPassed = checks.every(check => check.result === 'success');
+            
+            if (allPassed) {
+              comment += '\n🎉 All quality gates passed! This PR is ready for review.';
+            } else {
+              comment += '\n⚠️ Some quality gates failed. Please address the issues before merging.';
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(c => 
+              c.body.includes('PR Quality Gate Results') && c.user.login === 'github-actions[bot]'
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }

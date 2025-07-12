@@ -1,0 +1,87 @@
+name: Node.js App Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/*'
+    paths:
+      - 'nodejs-app/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'nodejs-app/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      force_deploy:
+        description: 'Force deployment even if no changes'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  APPLICATION_NAME: 'api-gateway'
+  APPLICATION_TYPE: 'nodejs'
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      should_deploy: ${{ steps.env.outputs.should_deploy }}
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/develop" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/feature/* ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should_deploy=${{ github.event.inputs.force_deploy || 'false' }}" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: determine-environment
+    if: needs.determine-environment.outputs.should_deploy == 'true'
+    uses: ./.github/workflows/shared-deployment.yml
+    with:
+      application_name: ${{ env.APPLICATION_NAME }}
+      environment: ${{ needs.determine-environment.outputs.environment }}
+      application_type: ${{ env.APPLICATION_TYPE }}
+      dockerfile_path: './nodejs-app/Dockerfile'
+      helm_chart_path: './helm-charts/nodejs-app'
+      run_regression_tests: true
+      skip_security_scans: false
+    secrets:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+      AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      CHECKMARX_TOKEN: ${{ secrets.CHECKMARX_TOKEN }}
+      AZURE_KEY_VAULT_NAME: ${{ secrets.AZURE_KEY_VAULT_NAME }}
