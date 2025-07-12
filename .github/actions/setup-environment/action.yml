@@ -1,0 +1,81 @@
+name: 'Setup Environment'
+description: 'Setup runtime environment for different application types'
+inputs:
+  application_type:
+    description: 'Application type (java-spring-boot, nodejs)'
+    required: true
+  environment:
+    description: 'Deployment environment'
+    required: true
+  node_version:
+    description: 'Node.js version'
+    required: false
+    default: '18'
+  java_version:
+    description: 'Java version'
+    required: false
+    default: '17'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js
+      if: ${{ inputs.application_type == 'nodejs' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node_version }}
+        cache: 'npm'
+
+    - name: Setup Java
+      if: ${{ inputs.application_type == 'java-spring-boot' }}
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ inputs.java_version }}
+        distribution: 'temurin'
+        cache: 'maven'
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: '3.12.0'
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: '1.28.0'
+
+    - name: Install dependencies (Node.js)
+      if: ${{ inputs.application_type == 'nodejs' }}
+      shell: bash
+      run: |
+        if [ -f package-lock.json ]; then
+          npm ci
+        elif [ -f yarn.lock ]; then
+          yarn install --frozen-lockfile
+        else
+          npm install
+        fi
+
+    - name: Install dependencies (Java)
+      if: ${{ inputs.application_type == 'java-spring-boot' }}
+      shell: bash
+      run: |
+        if [ -f pom.xml ]; then
+          ./mvnw dependency:resolve
+        elif [ -f build.gradle ]; then
+          ./gradlew dependencies
+        fi
+
+    - name: Set environment variables
+      shell: bash
+      run: |
+        echo "APPLICATION_TYPE=${{ inputs.application_type }}" >> $GITHUB_ENV
+        echo "DEPLOYMENT_ENVIRONMENT=${{ inputs.environment }}" >> $GITHUB_ENV
+        
+        # Set application-specific environment variables
+        if [[ "${{ inputs.application_type }}" == "java-spring-boot" ]]; then
+          echo "SPRING_PROFILES_ACTIVE=${{ inputs.environment }}" >> $GITHUB_ENV
+          echo "MAVEN_OPTS=-Dmaven.repo.local=.m2/repository" >> $GITHUB_ENV
+        elif [[ "${{ inputs.application_type }}" == "nodejs" ]]; then
+          echo "NODE_ENV=${{ inputs.environment }}" >> $GITHUB_ENV
+        fi

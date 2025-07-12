@@ -1,0 +1,169 @@
+name: 'Security Scans'
+description: 'Run SonarQube and Checkmarx security scans'
+inputs:
+  application_type:
+    description: 'Application type (java-spring-boot, nodejs)'
+    required: true
+  sonar_token:
+    description: 'SonarQube token'
+    required: true
+  checkmarx_token:
+    description: 'Checkmarx token'
+    required: true
+  sonar_url:
+    description: 'SonarQube server URL'
+    required: false
+    default: 'https://sonarcloud.io'
+  checkmarx_url:
+    description: 'Checkmarx server URL'
+    required: false
+    default: 'https://checkmarx.com'
+  coverage_threshold:
+    description: 'Code coverage threshold'
+    required: false
+    default: '80'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run unit tests with coverage (Java)
+      if: ${{ inputs.application_type == 'java-spring-boot' }}
+      shell: bash
+      run: |
+        if [ -f pom.xml ]; then
+          ./mvnw test jacoco:report
+        elif [ -f build.gradle ]; then
+          ./gradlew test jacocoTestReport
+        fi
+
+    - name: Run unit tests with coverage (Node.js)
+      if: ${{ inputs.application_type == 'nodejs' }}
+      shell: bash
+      run: |
+        npm test -- --coverage --watchAll=false
+
+    - name: SonarQube Scan (Java)
+      if: ${{ inputs.application_type == 'java-spring-boot' }}
+      shell: bash
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar_token }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        if [ -f pom.xml ]; then
+          ./mvnw sonar:sonar \
+            -Dsonar.host.url=${{ inputs.sonar_url }} \
+            -Dsonar.login=${{ inputs.sonar_token }} \
+            -Dsonar.projectKey=${GITHUB_REPOSITORY//\//_} \
+            -Dsonar.organization=${GITHUB_REPOSITORY_OWNER} \
+            -Dsonar.coverage.exclusions=**/*Test*.java,**/*IT.java \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+        elif [ -f build.gradle ]; then
+          ./gradlew sonarqube \
+            -Dsonar.host.url=${{ inputs.sonar_url }} \
+            -Dsonar.login=${{ inputs.sonar_token }} \
+            -Dsonar.projectKey=${GITHUB_REPOSITORY//\//_} \
+            -Dsonar.organization=${GITHUB_REPOSITORY_OWNER}
+        fi
+
+    - name: SonarQube Scan (Node.js)
+      if: ${{ inputs.application_type == 'nodejs' }}
+      uses: sonarqube-quality-gate-action@master
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar_token }}
+        GITHUB_TOKEN: ${{ github.token }}
+      with:
+        scanMetadataReportFile: .scannerwork/report-task.txt
+
+    - name: Run SonarScanner (Node.js)
+      if: ${{ inputs.application_type == 'nodejs' }}
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar_token }}
+        SONAR_HOST_URL: ${{ inputs.sonar_url }}
+      with:
+        args: >
+          -Dsonar.projectKey=${GITHUB_REPOSITORY//\//_}
+          -Dsonar.organization=${GITHUB_REPOSITORY_OWNER}
+          -Dsonar.sources=src
+          -Dsonar.tests=test
+          -Dsonar.test.exclusions=**/*.test.js,**/*.spec.js
+          -Dsonar.coverage.exclusions=**/*.test.js,**/*.spec.js,**/node_modules/**
+          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+    - name: OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: ${{ github.repository }}
+        path: '.'
+        format: 'ALL'
+        args: >
+          --enableRetired
+          --enableExperimental
+          --out reports
+
+    - name: Upload Dependency Check Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-check-report
+        path: reports/
+
+    - name: Checkmarx SAST Scan
+      uses: checkmarx-ts/checkmarx-cxflow-github-action@v1.6
+      with:
+        project: ${{ github.repository }}
+        team: '/CxServer/SP/Company'
+        checkmarx_url: ${{ inputs.checkmarx_url }}
+        checkmarx_username: ${{ github.actor }}
+        checkmarx_password: ${{ inputs.checkmarx_token }}
+        checkmarx_client_secret: ${{ inputs.checkmarx_token }}
+        incremental: false
+        preset: 'Checkmarx Default'
+        break_build: true
+        bug_tracker: 'SARIF'
+        params: '--logging.level.com.checkmarx=DEBUG'
+
+    - name: Upload Checkmarx Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: checkmarx-results
+        path: |
+          *.sarif
+          *.xml
+
+    - name: Code Quality Gate
+      shell: bash
+      run: |
+        echo "🔍 Security scans completed"
+        echo "📊 Results uploaded as artifacts"
+        
+        # Check if critical vulnerabilities were found
+        if [ -f "dependency-check-report.xml" ]; then
+          CRITICAL_VULNS=$(grep -c 'severity="HIGH"' dependency-check-report.xml || echo "0")
+          if [ "$CRITICAL_VULNS" -gt 0 ]; then
+            echo "❌ Found $CRITICAL_VULNS critical vulnerabilities"
+            exit 1
+          fi
+        fi
+        
+        echo "✅ Security quality gate passed"
+
+    - name: Comment PR with Security Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = '## 🔒 Security Scan Results\n\n';
+          comment += '- ✅ OWASP Dependency Check completed\n';
+          comment += '- ✅ SonarQube analysis completed\n';
+          comment += '- ✅ Checkmarx SAST scan completed\n\n';
+          comment += 'Detailed results are available in the workflow artifacts.';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });

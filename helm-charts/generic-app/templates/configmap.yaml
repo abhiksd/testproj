@@ -1,0 +1,19 @@
+{{- if .Values.configMapRef.name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapRef.name }}
+  labels:
+    {{- include "generic-app.labels" . | nindent 4 }}
+data:
+  # Add your configuration data here
+  app.properties: |
+    app.name={{ .Values.app.name }}
+    app.version={{ .Values.app.version }}
+    app.environment={{ .Values.app.environment }}
+    
+  # Application-specific configuration can be added here
+  # database.properties: |
+  #   database.host=localhost
+  #   database.port=5432
+{{- end }}

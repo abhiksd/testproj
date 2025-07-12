@@ -1,0 +1,102 @@
+name: 'Build Application'
+description: 'Build and push application container image'
+inputs:
+  application_type:
+    description: 'Application type (java-spring-boot, nodejs)'
+    required: true
+  dockerfile_path:
+    description: 'Path to Dockerfile'
+    required: true
+  image_name:
+    description: 'Full image name with registry'
+    required: true
+  image_tag:
+    description: 'Image tag'
+    required: true
+  build_args:
+    description: 'Build arguments for Docker (multiline)'
+    required: false
+
+outputs:
+  image_digest:
+    description: 'Image digest'
+    value: ${{ steps.build.outputs.digest }}
+  image_uri:
+    description: 'Full image URI'
+    value: ${{ inputs.image_name }}:${{ inputs.image_tag }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build application (Java Spring Boot)
+      if: ${{ inputs.application_type == 'java-spring-boot' }}
+      shell: bash
+      run: |
+        # Build the Spring Boot application
+        if [ -f pom.xml ]; then
+          ./mvnw clean package -DskipTests
+        elif [ -f build.gradle ]; then
+          ./gradlew build -x test
+        fi
+
+    - name: Build application (Node.js)
+      if: ${{ inputs.application_type == 'nodejs' }}
+      shell: bash
+      run: |
+        # Build the Node.js application
+        if [ -f package.json ]; then
+          npm run build 2>/dev/null || echo "No build script found, skipping build step"
+        fi
+
+    - name: Prepare build args
+      id: build-args
+      shell: bash
+      run: |
+        # Convert multiline build_args input to docker build format
+        BUILD_ARGS=""
+        if [ -n "${{ inputs.build_args }}" ]; then
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              BUILD_ARGS="$BUILD_ARGS --build-arg $line"
+            fi
+          done <<< "${{ inputs.build_args }}"
+        fi
+        echo "args=$BUILD_ARGS" >> $GITHUB_OUTPUT
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ${{ inputs.dockerfile_path }}
+        push: true
+        tags: |
+          ${{ inputs.image_name }}:${{ inputs.image_tag }}
+          ${{ inputs.image_name }}:latest
+        build-args: ${{ inputs.build_args }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ inputs.image_name }}:${{ inputs.image_tag }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom-${{ inputs.image_tag }}
+        path: sbom.spdx.json
+
+    - name: Output image details
+      shell: bash
+      run: |
+        echo "✅ Successfully built and pushed image:"
+        echo "   Image: ${{ inputs.image_name }}:${{ inputs.image_tag }}"
+        echo "   Digest: ${{ steps.build.outputs.digest }}"
